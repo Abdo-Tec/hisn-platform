@@ -1,0 +1,14 @@
+
+---
+
+## ثالثاً: رفع الكود إلى GitHub
+
+بعد إنشاء جميع الملفات داخل مجلد `hisn-platform`، افتح الطرفية (Terminal) داخل المجلد، ونفذ الأوامر التالية:
+
+```bash
+git init
+git add .
+git commit -m "النسخة الأولية من منصة حِصْن"
+git remote add origin https://github.com/Abdo-Tec/hisn-platform.git
+git branch -M main
+git push -u origin main
