@@ -73,9 +73,3 @@ async def check_sanctions(
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "sanctions-service"}
-conn = psycopg2.connect(
-    host="postgres",
-    database=os.getenv("POSTGRES_DB", "hisn_db"),
-    user=os.getenv("POSTGRES_USER", "hisn_user"),
-    password=os.getenv("POSTGRES_PASSWORD", "Hisn@2026!Secure")
-)
