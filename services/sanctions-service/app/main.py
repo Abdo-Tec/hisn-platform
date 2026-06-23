@@ -1,38 +1,3 @@
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
-from typing import Optional, List
-import psycopg2
-from urllib.parse import urlparse
-import os
-
-app = FastAPI(title="Hisn Sanctions Service", version="1.0.0")
-
-class SanctionCheckRequest(BaseModel):
-    full_name: str
-    language: str = "ar"
-
-class MatchResult(BaseModel):
-    matched_name: str
-    list_type: str
-    score: float
-
-class SanctionCheckResponse(BaseModel):
-    is_match: bool
-    matches: List[MatchResult] = []
-
-def get_db():
-    db_url = os.getenv("DATABASE_URL")
-    if db_url is None:
-        raise HTTPException(status_code=500, detail="DATABASE_URL not set")
-    result = urlparse(db_url)
-    return psycopg2.connect(
-        database=result.path[1:],
-        user=result.username,
-        password=result.password,
-        host=result.hostname,
-        port=result.port
-    )
-
 def init_db():
     try:
         conn = get_db()
@@ -56,33 +21,9 @@ def init_db():
         conn.commit()
         cur.close()
         conn.close()
-        print("✅ Database ready")
+        print("✅ Database tables ready.")
     except Exception as e:
-        print(f"⚠️ DB init error: {e}")
-
-@app.on_event("startup")
-async def startup():
-    init_db()
-
-@app.post("/sanctions/check", response_model=SanctionCheckResponse)
-async def check_sanctions(
-    request: SanctionCheckRequest,
-    x_api_key: str = Header(...),
-    x_tenant_id: str = Header(...)
-):
-    conn = get_db()
-    cur = conn.cursor()
-    lang = request.language
-    cur.execute(
-        f"SELECT full_name_ar, full_name_en, list_type FROM hisn.watchlist WHERE full_name_{'ar' if lang == 'ar' else 'en'} ILIKE %s",
-        (f"%{request.full_name}%",)
-    )
-    results = cur.fetchall()
-    cur.close()
-    conn.close()
-    matches = [MatchResult(matched_name=r[1] or r[0], list_type=r[2], score=1.0) for r in results]
-    return SanctionCheckResponse(is_match=len(matches) > 0, matches=matches)
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
+        print(f"❌ DB init error: {e}")
+        # أضفنا هذين السطرين:
+        import traceback
+        traceback.print_exc()
