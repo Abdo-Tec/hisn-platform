@@ -23,33 +23,28 @@ class SanctionCheckResponse(BaseModel):
 def get_db():
     db_url = os.getenv("DATABASE_URL")
     if db_url is None:
-        raise HTTPException(status_code=500, detail="DATABASE_URL environment variable is not set!")
-    
+        raise HTTPException(status_code=500, detail="DATABASE_URL not set")
     result = urlparse(db_url)
-    conn = psycopg2.connect(
+    return psycopg2.connect(
         database=result.path[1:],
         user=result.username,
         password=result.password,
         host=result.hostname,
         port=result.port
     )
-    return conn
 
 def init_db():
     try:
         conn = get_db()
         cur = conn.cursor()
-        
         cur.execute("""
             CREATE SCHEMA IF NOT EXISTS hisn;
-            
             CREATE TABLE IF NOT EXISTS hisn.tenants (
                 id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
                 name VARCHAR(255) NOT NULL,
                 api_key VARCHAR(64) UNIQUE NOT NULL,
                 created_at TIMESTAMP DEFAULT NOW()
             );
-            
             CREATE TABLE IF NOT EXISTS hisn.watchlist (
                 id SERIAL PRIMARY KEY,
                 full_name_ar VARCHAR(500),
@@ -61,12 +56,12 @@ def init_db():
         conn.commit()
         cur.close()
         conn.close()
-        print("✅ Database tables ready.")
+        print("✅ Database ready")
     except Exception as e:
-        print(f"⚠️ Database init skipped: {e}")
+        print(f"⚠️ DB init error: {e}")
 
 @app.on_event("startup")
-async def startup_event():
+async def startup():
     init_db()
 
 @app.post("/sanctions/check", response_model=SanctionCheckResponse)
@@ -77,36 +72,17 @@ async def check_sanctions(
 ):
     conn = get_db()
     cur = conn.cursor()
-    
-    if request.language == "ar":
-        cur.execute(
-            "SELECT full_name_ar, full_name_en, list_type FROM hisn.watchlist WHERE full_name_ar ILIKE %s",
-            (f"%{request.full_name}%",)
-        )
-    else:
-        cur.execute(
-            "SELECT full_name_ar, full_name_en, list_type FROM hisn.watchlist WHERE full_name_en ILIKE %s",
-            (f"%{request.full_name}%",)
-        )
-    
+    lang = request.language
+    cur.execute(
+        f"SELECT full_name_ar, full_name_en, list_type FROM hisn.watchlist WHERE full_name_{'ar' if lang == 'ar' else 'en'} ILIKE %s",
+        (f"%{request.full_name}%",)
+    )
     results = cur.fetchall()
     cur.close()
     conn.close()
-    
-    matches = [
-        MatchResult(
-            matched_name=row[1] or row[0],
-            list_type=row[2],
-            score=1.0
-        )
-        for row in results
-    ]
-    
-    return SanctionCheckResponse(
-        is_match=len(matches) > 0,
-        matches=matches
-    )
+    matches = [MatchResult(matched_name=r[1] or r[0], list_type=r[2], score=1.0) for r in results]
+    return SanctionCheckResponse(is_match=len(matches) > 0, matches=matches)
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "sanctions-service"}
+    return {"status": "ok"}
