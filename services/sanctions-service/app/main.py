@@ -1,4 +1,6 @@
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional, List
 import psycopg2
@@ -9,7 +11,7 @@ from datetime import datetime, timedelta
 import numpy as np
 from sklearn.ensemble import IsolationForest
 
-app = FastAPI(title="Hisn Risk Intelligence Platform", version="2.0.0")
+app = FastAPI(title="Hisn Risk Intelligence Platform", version="2.1.0")
 
 # ============================================================
 # نماذج AML
@@ -95,8 +97,7 @@ def init_db():
             );
         """)
         conn.commit()
-        
-        # إدراج بيانات عقوبات افتراضية
+
         cur.execute("SELECT COUNT(*) FROM hisn.watchlist")
         if cur.fetchone()[0] == 0:
             cur.execute("""
@@ -107,7 +108,7 @@ def init_db():
                 ('قاسم الريمي', 'Qasim al-Raymi', 'UN')
             """)
             conn.commit()
-        
+
         cur.close()
         conn.close()
         print("✅ Database ready")
@@ -209,3 +210,14 @@ async def evaluate_aml(request: AMLRequest):
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "hisn-platform"}
+
+# ============================================================
+# الملفات الثابتة ولوحة التحكم
+# ============================================================
+os.makedirs("static", exist_ok=True)
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get("/")
+async def dashboard():
+    return FileResponse("static/index.html")
