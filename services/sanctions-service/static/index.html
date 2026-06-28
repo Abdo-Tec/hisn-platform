@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>حِصْن | منصة الامتثال المالي</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Tajawal', sans-serif; background: #0f172a; color: #e2e8f0; display: flex; min-height: 100vh; }
+        .sidebar { width: 260px; background: #1e293b; padding: 30px 20px; border-left: 1px solid #334155; }
+        .sidebar h2 { color: #f59e0b; margin-bottom: 40px; font-size: 24px; }
+        .sidebar button { display: block; width: 100%; padding: 14px; margin-bottom: 12px; background: #334155; color: #e2e8f0; border: none; border-radius: 8px; cursor: pointer; font-size: 16px; transition: 0.3s; }
+        .sidebar button.active, .sidebar button:hover { background: #f59e0b; color: #0f172a; font-weight: bold; }
+        .main { flex: 1; padding: 40px; }
+        .section { display: none; }
+        .section.active { display: block; }
+        .card { background: #1e293b; padding: 30px; border-radius: 16px; margin-bottom: 20px; border: 1px solid #334155; }
+        .card h3 { margin-bottom: 20px; color: #f59e0b; }
+        .form-group { margin-bottom: 18px; }
+        label { display: block; margin-bottom: 6px; color: #94a3b8; }
+        input, select { width: 100%; padding: 12px; background: #0f172a; border: 1px solid #334155; border-radius: 8px; color: #e2e8f0; font-size: 16px; }
+        button.submit { padding: 12px 30px; background: #f59e0b; color: #0f172a; border: none; border-radius: 8px; cursor: pointer; font-size: 16px; font-weight: bold; }
+        .result { margin-top: 20px; padding: 20px; border-radius: 8px; }
+        .result.high { background: #7f1d1d; border: 1px solid #ef4444; }
+        .result.medium { background: #78350f; border: 1px solid #f59e0b; }
+        .result.low { background: #14532d; border: 1px solid #22c55e; }
+        .result.match { background: #7f1d1d; border: 1px solid #ef4444; }
+        .result.no-match { background: #14532d; border: 1px solid #22c55e; }
+        .badge { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 14px; margin: 4px; }
+        .badge.rule { background: #f59e0b; color: #0f172a; }
+    </style>
+</head>
+<body>
+    <div class="sidebar">
+        <h2>🛡️ حِصْن</h2>
+        <button class="active" onclick="showSection('sanctions')">🔍 فحص العقوبات</button>
+        <button onclick="showSection('aml')">💰 تقييم AML</button>
+    </div>
+    <div class="main">
+        <!-- فحص العقوبات -->
+        <div id="section-sanctions" class="section active">
+            <div class="card">
+                <h3>🔍 فحص قوائم العقوبات</h3>
+                <div class="form-group">
+                    <label>الاسم الكامل</label>
+                    <input type="text" id="sanction-name" placeholder="أدخل الاسم للفحص...">
+                </div>
+                <div class="form-group">
+                    <label>اللغة</label>
+                    <select id="sanction-lang">
+                        <option value="ar">العربية</option>
+                        <option value="en">الإنجليزية</option>
+                    </select>
+                </div>
+                <button class="submit" onclick="checkSanctions()">فحص</button>
+                <div id="sanction-result"></div>
+            </div>
+        </div>
+
+        <!-- تقييم AML -->
+        <div id="section-aml" class="section">
+            <div class="card">
+                <h3>💰 تقييم مخاطر غسل الأموال</h3>
+                <div class="form-group">
+                    <label>رقم العميل</label>
+                    <input type="text" id="aml-customer" placeholder="Customer ID">
+                </div>
+                <div class="form-group">
+                    <label>المبلغ (ريال)</label>
+                    <input type="number" id="aml-amount" placeholder="المبلغ">
+                </div>
+                <div class="form-group">
+                    <label>الدولة</label>
+                    <select id="aml-country">
+                        <option value="SA">🇸🇦 السعودية</option>
+                        <option value="IR">🇮🇷 إيران</option>
+                        <option value="SY">🇸🇾 سوريا</option>
+                        <option value="AF">🇦🇫 أفغانستان</option>
+                        <option value="US">🇺🇸 الولايات المتحدة</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>نوع المعاملة</label>
+                    <select id="aml-type">
+                        <option value="deposit">إيداع</option>
+                        <option value="withdrawal">سحب</option>
+                        <option value="transfer">تحويل</option>
+                    </select>
+                </div>
+                <button class="submit" onclick="evaluateAML()">تقييم</button>
+                <div id="aml-result"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function showSection(section) {
+            document.querySelectorAll('.section').forEach(el => el.classList.remove('active'));
+            document.getElementById('section-' + section).classList.add('active');
+            document.querySelectorAll('.sidebar button').forEach(btn => btn.classList.remove('active'));
+            event.target.classList.add('active');
+        }
+
+        async function checkSanctions() {
+            const name = document.getElementById('sanction-name').value;
+            const lang = document.getElementById('sanction-lang').value;
+            const resultDiv = document.getElementById('sanction-result');
+            resultDiv.innerHTML = '⏳ جاري الفحص...';
+            try {
+                const res = await fetch('/sanctions/check', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'x-api-key': 'dashboard', 'x-tenant-id': 'dashboard' },
+                    body: JSON.stringify({ full_name: name, language: lang })
+                });
+                const data = await res.json();
+                if (data.is_match) {
+                    resultDiv.innerHTML = '<div class="result match"><strong>⚠️ تم العثور على تطابق!</strong><br>' + data.matches.map(m => m.matched_name + ' (' + m.list_type + ')').join('<br>') + '</div>';
+                } else {
+                    resultDiv.innerHTML = '<div class="result no-match"><strong>✅ لا يوجد تطابق.</strong></div>';
+                }
+            } catch (e) {
+                resultDiv.innerHTML = '<div class="result high">❌ حدث خطأ في الاتصال بالخدمة.</div>';
+            }
+        }
+
+        async function evaluateAML() {
+            const customer = document.getElementById('aml-customer').value;
+            const amount = parseFloat(document.getElementById('aml-amount').value);
+            const country = document.getElementById('aml-country').value;
+            const type = document.getElementById('aml-type').value;
+            const resultDiv = document.getElementById('aml-result');
+            resultDiv.innerHTML = '⏳ جاري التقييم...';
+            try {
+                const res = await fetch('/aml/evaluate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'x-api-key': 'dashboard', 'x-tenant-id': 'dashboard' },
+                    body: JSON.stringify({ customer_id: customer, amount: amount, currency: 'SAR', country: country, transaction_type: type })
+                });
+                const data = await res.json();
+                const levelClass = data.risk_level === 'high' ? 'high' : data.risk_level === 'medium' ? 'medium' : 'low';
+                let html = `<div class="result ${levelClass}"><strong>درجة الخطورة: ${data.risk_score} (${data.risk_level === 'high' ? 'مرتفعة' : data.risk_level === 'medium' ? 'متوسطة' : 'منخفضة'})</strong><br>`;
+                if (data.triggered_rules.length > 0) {
+                    html += 'القواعد المشغلة: ' + data.triggered_rules.map(r => '<span class="badge rule">' + r + '</span>').join(' ');
+                }
+                html += '</div>';
+                resultDiv.innerHTML = html;
+            } catch (e) {
+                resultDiv.innerHTML = '<div class="result high">❌ حدث خطأ في الاتصال بالخدمة.</div>';
+            }
+        }
+    </script>
+</body>
+</html>
