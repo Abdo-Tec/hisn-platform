@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 import numpy as np
 from sklearn.ensemble import IsolationForest
 
-app = FastAPI(title="Hisn Risk Intelligence Platform", version="2.2.0")
+app = FastAPI(title="Hisn Risk Intelligence Platform", version="3.0.0")
 
 # ============================================================
 # نماذج AML
@@ -32,6 +32,24 @@ class AMLRequest(BaseModel):
 class AMLRiskAssessment(BaseModel):
     risk_score: float
     risk_level: str
+    triggered_rules: List[str] = []
+
+# ============================================================
+# نماذج كشف الاحتيال
+# ============================================================
+class FraudRequest(BaseModel):
+    customer_id: str
+    amount: float
+    device_id: Optional[str] = None
+    ip_address: Optional[str] = None
+    location: Optional[str] = None
+    transaction_type: str = "payment"
+    failed_attempts: int = 0
+    timestamp: Optional[str] = None
+
+class FraudAssessment(BaseModel):
+    fraud_score: float
+    fraud_level: str
     triggered_rules: List[str] = []
 
 # ============================================================
@@ -93,6 +111,24 @@ def init_db():
                 country VARCHAR(5),
                 transaction_type VARCHAR(50),
                 timestamp TIMESTAMP DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS hisn.fraud_transactions (
+                id SERIAL PRIMARY KEY,
+                customer_id VARCHAR(255),
+                amount DECIMAL(15,2),
+                device_id VARCHAR(255),
+                ip_address VARCHAR(50),
+                location VARCHAR(255),
+                transaction_type VARCHAR(50),
+                failed_attempts INTEGER DEFAULT 0,
+                timestamp TIMESTAMP DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS hisn.customer_profiles (
+                customer_id VARCHAR(255) PRIMARY KEY,
+                avg_amount DECIMAL(15,2) DEFAULT 0,
+                common_location VARCHAR(255),
+                common_device VARCHAR(255),
+                total_transactions INTEGER DEFAULT 0
             );
         """)
         conn.commit()
@@ -201,6 +237,93 @@ async def evaluate_aml(request: AMLRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================================
+# نقطة نهاية كشف الاحتيال
+# ============================================================
+@app.post("/fraud/check", response_model=FraudAssessment)
+async def check_fraud(request: FraudRequest):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        fraud_score = 0.0
+        triggered = []
+
+        ref_time = datetime.fromisoformat(request.timestamp) if request.timestamp else datetime.utcnow()
+
+        # قاعدة 1: سرعة المعاملات
+        window_start = ref_time - timedelta(minutes=5)
+        cur.execute(
+            "SELECT COUNT(*) FROM hisn.fraud_transactions WHERE customer_id = %s AND timestamp >= %s",
+            (request.customer_id, window_start)
+        )
+        recent_count = cur.fetchone()[0]
+        if recent_count >= 3:
+            triggered.append("high_velocity_3_in_5min")
+            fraud_score += 0.5
+
+        # قاعدة 2: مبلغ غير معتاد
+        cur.execute(
+            "SELECT AVG(amount) FROM hisn.fraud_transactions WHERE customer_id = %s",
+            (request.customer_id,)
+        )
+        avg = cur.fetchone()[0]
+        if avg and request.amount > avg * 3:
+            triggered.append("unusual_amount_3x_avg")
+            fraud_score += 0.4
+
+        # قاعدة 3: موقع مختلف
+        if request.location:
+            cur.execute(
+                "SELECT common_location FROM hisn.customer_profiles WHERE customer_id = %s",
+                (request.customer_id,)
+            )
+            profile = cur.fetchone()
+            if profile and profile[0] and profile[0] != request.location:
+                triggered.append("location_mismatch")
+                fraud_score += 0.6
+
+        # قاعدة 4: معاملة ليلية
+        hour = ref_time.hour
+        if hour >= 0 and hour < 5:
+            triggered.append("off_hours_transaction")
+            fraud_score += 0.2
+
+        # قاعدة 5: محاولات فاشلة متعددة
+        if request.failed_attempts >= 3:
+            triggered.append("multiple_failed_attempts")
+            fraud_score += 0.7
+
+        # تخزين المعاملة
+        cur.execute(
+            "INSERT INTO hisn.fraud_transactions (customer_id, amount, device_id, ip_address, location, transaction_type, failed_attempts, timestamp) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+            (request.customer_id, request.amount, request.device_id, request.ip_address, request.location, request.transaction_type, request.failed_attempts, ref_time)
+        )
+
+        # تحديث ملف العميل
+        cur.execute(
+            """
+            INSERT INTO hisn.customer_profiles (customer_id, avg_amount, common_location, common_device, total_transactions)
+            VALUES (%s, %s, %s, %s, 1)
+            ON CONFLICT (customer_id) DO UPDATE SET
+                avg_amount = (hisn.customer_profiles.avg_amount * hisn.customer_profiles.total_transactions + %s) / (hisn.customer_profiles.total_transactions + 1),
+                common_location = COALESCE(%s, hisn.customer_profiles.common_location),
+                common_device = COALESCE(%s, hisn.customer_profiles.common_device),
+                total_transactions = hisn.customer_profiles.total_transactions + 1
+            """,
+            (request.customer_id, request.amount, request.location, request.device_id,
+             request.amount, request.location, request.device_id)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        fraud_score = min(fraud_score, 1.0)
+        fraud_level = "high" if fraud_score >= 0.7 else "medium" if fraud_score >= 0.4 else "low"
+        return FraudAssessment(fraud_score=round(fraud_score, 2), fraud_level=fraud_level, triggered_rules=triggered)
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================================
 # فحص السلامة
 # ============================================================
 @app.get("/health")
@@ -208,7 +331,7 @@ async def health():
     return {"status": "ok", "service": "hisn-platform"}
 
 # ============================================================
-# لوحة التحكم (مضمنة مباشرة)
+# لوحة التحكم (محدثة - 3 محركات)
 # ============================================================
 DASHBOARD_HTML = """
 <!DOCTYPE html>
@@ -248,6 +371,7 @@ DASHBOARD_HTML = """
         <h2>🛡️ حِصْن</h2>
         <button class="active" onclick="showSection('sanctions')">🔍 فحص العقوبات</button>
         <button onclick="showSection('aml')">💰 تقييم AML</button>
+        <button onclick="showSection('fraud')">🕵️ كشف الاحتيال</button>
     </div>
     <div class="main">
         <div id="section-sanctions" class="section active">
@@ -268,6 +392,18 @@ DASHBOARD_HTML = """
                 <div class="form-group"><label>نوع المعاملة</label><select id="aml-type"><option value="deposit">إيداع</option><option value="withdrawal">سحب</option><option value="transfer">تحويل</option></select></div>
                 <button class="submit" onclick="evaluateAML()">تقييم</button>
                 <div id="aml-result"></div>
+            </div>
+        </div>
+        <div id="section-fraud" class="section">
+            <div class="card">
+                <h3>🕵️ كشف الاحتيال</h3>
+                <div class="form-group"><label>رقم العميل</label><input type="text" id="fraud-customer" placeholder="Customer ID"></div>
+                <div class="form-group"><label>المبلغ (ريال)</label><input type="number" id="fraud-amount" placeholder="المبلغ"></div>
+                <div class="form-group"><label>الموقع</label><input type="text" id="fraud-location" placeholder="مثال: الرياض"></div>
+                <div class="form-group"><label>نوع المعاملة</label><select id="fraud-type"><option value="payment">دفع</option><option value="transfer">تحويل</option><option value="withdrawal">سحب</option></select></div>
+                <div class="form-group"><label>محاولات فاشلة سابقة</label><input type="number" id="fraud-failed" value="0"></div>
+                <button class="submit" onclick="checkFraud()">فحص</button>
+                <div id="fraud-result"></div>
             </div>
         </div>
     </div>
@@ -315,6 +451,32 @@ DASHBOARD_HTML = """
                 const data = await res.json();
                 const levelClass = data.risk_level === 'high' ? 'high' : data.risk_level === 'medium' ? 'medium' : 'low';
                 let html = `<div class="result ${levelClass}"><strong>درجة الخطورة: ${data.risk_score} (${data.risk_level === 'high' ? 'مرتفعة' : data.risk_level === 'medium' ? 'متوسطة' : 'منخفضة'})</strong><br>`;
+                if (data.triggered_rules.length > 0) {
+                    html += 'القواعد المشغلة: ' + data.triggered_rules.map(r => '<span class="badge rule">' + r + '</span>').join(' ');
+                }
+                html += '</div>';
+                resultDiv.innerHTML = html;
+            } catch (e) {
+                resultDiv.innerHTML = '<div class="result high">❌ حدث خطأ في الاتصال بالخدمة.</div>';
+            }
+        }
+        async function checkFraud() {
+            const customer = document.getElementById('fraud-customer').value;
+            const amount = parseFloat(document.getElementById('fraud-amount').value);
+            const location = document.getElementById('fraud-location').value;
+            const type = document.getElementById('fraud-type').value;
+            const failed = parseInt(document.getElementById('fraud-failed').value);
+            const resultDiv = document.getElementById('fraud-result');
+            resultDiv.innerHTML = '⏳ جاري الفحص...';
+            try {
+                const res = await fetch('/fraud/check', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ customer_id: customer, amount: amount, location: location, transaction_type: type, failed_attempts: failed })
+                });
+                const data = await res.json();
+                const levelClass = data.fraud_level === 'high' ? 'high' : data.fraud_level === 'medium' ? 'medium' : 'low';
+                let html = `<div class="result ${levelClass}"><strong>درجة الاحتيال: ${data.fraud_score} (${data.fraud_level === 'high' ? 'مرتفعة' : data.fraud_level === 'medium' ? 'متوسطة' : 'منخفضة'})</strong><br>`;
                 if (data.triggered_rules.length > 0) {
                     html += 'القواعد المشغلة: ' + data.triggered_rules.map(r => '<span class="badge rule">' + r + '</span>').join(' ');
                 }
