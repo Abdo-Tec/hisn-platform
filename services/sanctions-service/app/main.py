@@ -11,7 +11,7 @@ import uuid
 import numpy as np
 from sklearn.ensemble import IsolationForest
 
-app = FastAPI(title="Hisn Risk Intelligence Platform", version="4.0.0")
+app = FastAPI(title="Hisn Risk Intelligence Platform", version="5.0.0")
 
 # ============================================================
 # نماذج AML
@@ -70,7 +70,7 @@ class SanctionCheckResponse(BaseModel):
     matches: List[MatchResult] = []
 
 # ============================================================
-# نماذج SAR (تقارير الاشتباه)
+# نماذج SAR
 # ============================================================
 class SARRequest(BaseModel):
     subject_name: str
@@ -88,20 +88,20 @@ class SARResponse(BaseModel):
     created_at: str
 
 # ============================================================
-# نماذج إدارة الحالات (Case Management)
+# نماذج إدارة الحالات
 # ============================================================
 class CaseCreateRequest(BaseModel):
     alert_id: Optional[str] = None
-    case_type: str  # "sanctions", "aml", "fraud"
+    case_type: str
     subject_name: str
     subject_id: Optional[str] = None
-    priority: str = "medium"  # "low", "medium", "high", "critical"
+    priority: str = "medium"
     description: str
     assigned_to: Optional[str] = None
     source: str = "system"
 
 class CaseUpdateRequest(BaseModel):
-    status: Optional[str] = None  # "open", "in_progress", "escalated", "closed"
+    status: Optional[str] = None
     notes: Optional[str] = None
     resolution: Optional[str] = None
     assigned_to: Optional[str] = None
@@ -126,6 +126,20 @@ def get_db():
         host=result.hostname,
         port=result.port
     )
+
+def log_audit(action: str, user: str = "system", details: str = "", tenant_id: str = "default"):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO hisn.audit_trail (action, user_id, details, tenant_id) VALUES (%s, %s, %s, %s)",
+            (action, user, details, tenant_id)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except:
+        pass
 
 def init_db():
     try:
@@ -211,6 +225,20 @@ def init_db():
                 created_by VARCHAR(255) DEFAULT 'system',
                 created_at TIMESTAMP DEFAULT NOW()
             );
+            CREATE TABLE IF NOT EXISTS hisn.audit_trail (
+                id SERIAL PRIMARY KEY,
+                action VARCHAR(255),
+                user_id VARCHAR(255) DEFAULT 'system',
+                details TEXT,
+                tenant_id VARCHAR(255) DEFAULT 'default',
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS hisn.kpi_summary (
+                id SERIAL PRIMARY KEY,
+                metric_name VARCHAR(255) UNIQUE,
+                metric_value DECIMAL(15,2),
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
         """)
         conn.commit()
 
@@ -225,6 +253,28 @@ def init_db():
             """)
             conn.commit()
 
+        # تحديث KPI summary
+        cur.execute("SELECT COUNT(*) FROM hisn.sar_reports")
+        sar_count = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM hisn.cases WHERE status = 'open'")
+        open_cases = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM hisn.watchlist")
+        watchlist_count = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM hisn.aml_transactions")
+        aml_count = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM hisn.fraud_transactions")
+        fraud_count = cur.fetchone()[0]
+        cur.execute("""
+            INSERT INTO hisn.kpi_summary (metric_name, metric_value, updated_at)
+            VALUES ('total_sar', %s, NOW()),
+                   ('open_cases', %s, NOW()),
+                   ('watchlist_entries', %s, NOW()),
+                   ('aml_transactions', %s, NOW()),
+                   ('fraud_transactions', %s, NOW())
+            ON CONFLICT (metric_name) DO UPDATE SET metric_value = EXCLUDED.metric_value, updated_at = NOW()
+        """, (sar_count, open_cases, watchlist_count, aml_count, fraud_count))
+        conn.commit()
+
         cur.close()
         conn.close()
         print("✅ Database ready")
@@ -235,9 +285,58 @@ def init_db():
 @app.on_event("startup")
 async def startup():
     init_db()
+    log_audit("system_startup", "system", "Application started successfully")
 
 # ============================================================
-# نقطة نهاية فحص العقوبات
+# Audit Trail API
+# ============================================================
+@app.get("/audit/list")
+async def list_audit(limit: int = Query(50)):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT action, user_id, details, tenant_id, created_at FROM hisn.audit_trail ORDER BY created_at DESC LIMIT %s", (limit,))
+        results = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [{"action": r[0], "user_id": r[1], "details": r[2], "tenant_id": r[3], "created_at": r[4].isoformat()} for r in results]
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================================
+# Executive Dashboard API
+# ============================================================
+@app.get("/executive/kpis")
+async def executive_kpis():
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT metric_name, metric_value FROM hisn.kpi_summary")
+        results = cur.fetchall()
+        kpis = {r[0]: float(r[1]) for r in results}
+        cur.execute("SELECT COUNT(*) FROM hisn.cases WHERE status = 'open'")
+        kpis['open_cases'] = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM hisn.sar_reports WHERE created_at >= NOW() - INTERVAL '24 hours'")
+        kpis['sar_last_24h'] = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM hisn.aml_transactions WHERE timestamp >= NOW() - INTERVAL '24 hours'")
+        kpis['aml_last_24h'] = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM hisn.fraud_transactions WHERE timestamp >= NOW() - INTERVAL '24 hours'")
+        kpis['fraud_last_24h'] = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM hisn.cases WHERE priority IN ('high', 'critical') AND status = 'open'")
+        kpis['high_priority_open'] = cur.fetchone()[0]
+        cur.execute("SELECT AVG(risk_score) FROM hisn.sar_reports WHERE created_at >= NOW() - INTERVAL '7 days'")
+        avg_risk = cur.fetchone()[0]
+        kpis['avg_risk_7d'] = round(float(avg_risk) if avg_risk else 0, 2)
+        cur.close()
+        conn.close()
+        return kpis
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================================
+# باقي نقاط API (عقوبات, AML, احتيال, SAR, حالات)
 # ============================================================
 @app.post("/sanctions/check", response_model=SanctionCheckResponse)
 async def check_sanctions(request: SanctionCheckRequest):
@@ -253,14 +352,12 @@ async def check_sanctions(request: SanctionCheckRequest):
         cur.close()
         conn.close()
         matches = [MatchResult(matched_name=r[1] or r[0], list_type=r[2], score=1.0) for r in results]
+        log_audit("sanctions_check", "system", f"Checked: {request.full_name}, Match: {len(matches) > 0}")
         return SanctionCheckResponse(is_match=len(matches) > 0, matches=matches)
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-# ============================================================
-# نقطة نهاية AML
-# ============================================================
 @app.post("/aml/evaluate", response_model=AMLRiskAssessment)
 async def evaluate_aml(request: AMLRequest):
     try:
@@ -268,58 +365,40 @@ async def evaluate_aml(request: AMLRequest):
         cur = conn.cursor()
         risk_score = 0.0
         triggered = []
-
         if request.amount > 50000:
             triggered.append("high_amount_exceeds_50k")
             risk_score += 0.4
-
         if request.country.upper() in HIGH_RISK_COUNTRIES:
             triggered.append("high_risk_country")
             risk_score += 0.5
-
         ref_time = datetime.fromisoformat(request.timestamp) if request.timestamp else datetime.utcnow()
         window_start = ref_time - timedelta(minutes=10)
-        cur.execute(
-            "SELECT COUNT(*) FROM hisn.aml_transactions WHERE customer_id = %s AND timestamp >= %s",
-            (request.customer_id, window_start)
-        )
+        cur.execute("SELECT COUNT(*) FROM hisn.aml_transactions WHERE customer_id = %s AND timestamp >= %s", (request.customer_id, window_start))
         if cur.fetchone()[0] >= 5:
             triggered.append("rapid_transactions_5_in_10min")
             risk_score += 0.3
-
         if request.transaction_type == "deposit" and 40000 <= request.amount < 50000:
             day_start = ref_time - timedelta(hours=24)
-            cur.execute(
-                "SELECT COUNT(*) FROM hisn.aml_transactions WHERE customer_id = %s AND transaction_type='deposit' AND amount >= 40000 AND amount < 50000 AND timestamp >= %s",
-                (request.customer_id, day_start)
-            )
+            cur.execute("SELECT COUNT(*) FROM hisn.aml_transactions WHERE customer_id = %s AND transaction_type='deposit' AND amount >= 40000 AND amount < 50000 AND timestamp >= %s", (request.customer_id, day_start))
             if cur.fetchone()[0] >= 3:
                 triggered.append("possible_structuring")
                 risk_score += 0.6
-
         amount_np = np.array([[request.amount]])
         if amounts_model.predict(amount_np)[0] == -1:
             triggered.append("ml_anomaly_amount")
             risk_score += 0.3
-
-        cur.execute(
-            "INSERT INTO hisn.aml_transactions (customer_id, amount, currency, country, transaction_type, timestamp) VALUES (%s,%s,%s,%s,%s,%s)",
-            (request.customer_id, request.amount, request.currency, request.country.upper(), request.transaction_type, ref_time)
-        )
+        cur.execute("INSERT INTO hisn.aml_transactions (customer_id, amount, currency, country, transaction_type, timestamp) VALUES (%s,%s,%s,%s,%s,%s)", (request.customer_id, request.amount, request.currency, request.country.upper(), request.transaction_type, ref_time))
         conn.commit()
         cur.close()
         conn.close()
-
         risk_score = min(risk_score, 1.0)
         risk_level = "high" if risk_score >= 0.7 else "medium" if risk_score >= 0.4 else "low"
+        log_audit("aml_evaluate", "system", f"Customer: {request.customer_id}, Score: {risk_score}, Level: {risk_level}")
         return AMLRiskAssessment(risk_score=round(risk_score, 2), risk_level=risk_level, triggered_rules=triggered)
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-# ============================================================
-# نقطة نهاية كشف الاحتيال
-# ============================================================
 @app.post("/fraud/check", response_model=FraudAssessment)
 async def check_fraud(request: FraudRequest):
     try:
@@ -327,45 +406,32 @@ async def check_fraud(request: FraudRequest):
         cur = conn.cursor()
         fraud_score = 0.0
         triggered = []
-
         ref_time = datetime.fromisoformat(request.timestamp) if request.timestamp else datetime.utcnow()
         window_start = ref_time - timedelta(minutes=5)
-        cur.execute(
-            "SELECT COUNT(*) FROM hisn.fraud_transactions WHERE customer_id = %s AND timestamp >= %s",
-            (request.customer_id, window_start)
-        )
+        cur.execute("SELECT COUNT(*) FROM hisn.fraud_transactions WHERE customer_id = %s AND timestamp >= %s", (request.customer_id, window_start))
         if cur.fetchone()[0] >= 3:
             triggered.append("high_velocity_3_in_5min")
             fraud_score += 0.5
-
         cur.execute("SELECT AVG(amount) FROM hisn.fraud_transactions WHERE customer_id = %s", (request.customer_id,))
         avg = cur.fetchone()[0]
         if avg and request.amount > avg * 3:
             triggered.append("unusual_amount_3x_avg")
             fraud_score += 0.4
-
         if request.location:
             cur.execute("SELECT common_location FROM hisn.customer_profiles WHERE customer_id = %s", (request.customer_id,))
             profile = cur.fetchone()
             if profile and profile[0] and profile[0] != request.location:
                 triggered.append("location_mismatch")
                 fraud_score += 0.6
-
         hour = ref_time.hour
         if 0 <= hour < 5:
             triggered.append("off_hours_transaction")
             fraud_score += 0.2
-
         if request.failed_attempts >= 3:
             triggered.append("multiple_failed_attempts")
             fraud_score += 0.7
-
-        cur.execute(
-            "INSERT INTO hisn.fraud_transactions (customer_id, amount, device_id, ip_address, location, transaction_type, failed_attempts, timestamp) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
-            (request.customer_id, request.amount, request.device_id, request.ip_address, request.location, request.transaction_type, request.failed_attempts, ref_time)
-        )
-        cur.execute(
-            """
+        cur.execute("INSERT INTO hisn.fraud_transactions (customer_id, amount, device_id, ip_address, location, transaction_type, failed_attempts, timestamp) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", (request.customer_id, request.amount, request.device_id, request.ip_address, request.location, request.transaction_type, request.failed_attempts, ref_time))
+        cur.execute("""
             INSERT INTO hisn.customer_profiles (customer_id, avg_amount, common_location, common_device, total_transactions)
             VALUES (%s, %s, %s, %s, 1)
             ON CONFLICT (customer_id) DO UPDATE SET
@@ -373,39 +439,29 @@ async def check_fraud(request: FraudRequest):
                 common_location = COALESCE(%s, hisn.customer_profiles.common_location),
                 common_device = COALESCE(%s, hisn.customer_profiles.common_device),
                 total_transactions = hisn.customer_profiles.total_transactions + 1
-            """,
-            (request.customer_id, request.amount, request.location, request.device_id, request.amount, request.location, request.device_id)
-        )
+        """, (request.customer_id, request.amount, request.location, request.device_id, request.amount, request.location, request.device_id))
         conn.commit()
         cur.close()
         conn.close()
-
         fraud_score = min(fraud_score, 1.0)
         fraud_level = "high" if fraud_score >= 0.7 else "medium" if fraud_score >= 0.4 else "low"
+        log_audit("fraud_check", "system", f"Customer: {request.customer_id}, Score: {fraud_score}, Level: {fraud_level}")
         return FraudAssessment(fraud_score=round(fraud_score, 2), fraud_level=fraud_level, triggered_rules=triggered)
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-# ============================================================
-# نقطة نهاية SAR (تقارير الاشتباه)
-# ============================================================
 @app.post("/sar/generate", response_model=SARResponse)
 async def generate_sar(request: SARRequest):
     try:
         conn = get_db()
         cur = conn.cursor()
         sar_id = f"SAR-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
-        cur.execute(
-            """
-            INSERT INTO hisn.sar_reports (sar_id, subject_name, subject_id, transaction_id, reason, triggered_rules, risk_score, reported_by, notes, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'submitted')
-            """,
-            (sar_id, request.subject_name, request.subject_id, request.transaction_id, request.reason, ",".join(request.triggered_rules), request.risk_score, request.reported_by, request.notes)
-        )
+        cur.execute("INSERT INTO hisn.sar_reports (sar_id, subject_name, subject_id, transaction_id, reason, triggered_rules, risk_score, reported_by, notes, status) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'submitted')", (sar_id, request.subject_name, request.subject_id, request.transaction_id, request.reason, ",".join(request.triggered_rules), request.risk_score, request.reported_by, request.notes))
         conn.commit()
         cur.close()
         conn.close()
+        log_audit("sar_generated", "system", f"SAR: {sar_id}, Subject: {request.subject_name}")
         return SARResponse(sar_id=sar_id, status="submitted", created_at=datetime.utcnow().isoformat())
     except Exception as e:
         traceback.print_exc()
@@ -428,30 +484,19 @@ async def list_sars(limit: int = Query(20), status: Optional[str] = None):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-# ============================================================
-# نقطة نهاية إدارة الحالات (Case Management)
-# ============================================================
 @app.post("/cases/create", response_model=CaseResponse)
 async def create_case(request: CaseCreateRequest):
     try:
         conn = get_db()
         cur = conn.cursor()
         case_id = f"CASE-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
-        cur.execute(
-            """
-            INSERT INTO hisn.cases (case_id, alert_id, case_type, subject_name, subject_id, priority, status, description, assigned_to, source)
-            VALUES (%s, %s, %s, %s, %s, %s, 'open', %s, %s, %s)
-            """,
-            (case_id, request.alert_id, request.case_type, request.subject_name, request.subject_id, request.priority, request.description, request.assigned_to, request.source)
-        )
+        cur.execute("INSERT INTO hisn.cases (case_id, alert_id, case_type, subject_name, subject_id, priority, status, description, assigned_to, source) VALUES (%s, %s, %s, %s, %s, %s, 'open', %s, %s, %s)", (case_id, request.alert_id, request.case_type, request.subject_name, request.subject_id, request.priority, request.description, request.assigned_to, request.source))
         if request.description:
-            cur.execute(
-                "INSERT INTO hisn.case_notes (case_id, note, created_by) VALUES (%s, %s, 'system')",
-                (case_id, request.description)
-            )
+            cur.execute("INSERT INTO hisn.case_notes (case_id, note, created_by) VALUES (%s, %s, 'system')", (case_id, request.description))
         conn.commit()
         cur.close()
         conn.close()
+        log_audit("case_created", "system", f"Case: {case_id}, Type: {request.case_type}")
         return CaseResponse(case_id=case_id, status="open", created_at=datetime.utcnow().isoformat())
     except Exception as e:
         traceback.print_exc()
@@ -481,6 +526,7 @@ async def update_case_status(case_id: str, request: CaseUpdateRequest):
         conn.commit()
         cur.close()
         conn.close()
+        log_audit("case_updated", "system", f"Case: {case_id}, New Status: {request.status or 'unchanged'}")
         return {"message": "Case updated", "case_id": case_id}
     except Exception as e:
         traceback.print_exc()
@@ -535,15 +581,12 @@ async def get_case(case_id: str):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-# ============================================================
-# فحص السلامة
-# ============================================================
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "hisn-platform"}
 
 # ============================================================
-# لوحة التحكم (محدثة - 5 أقسام)
+# لوحة التحكم v5.0 (7 أقسام)
 # ============================================================
 DASHBOARD_HTML = """
 <!DOCTYPE html>
@@ -555,9 +598,9 @@ DASHBOARD_HTML = """
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: 'Tajawal', sans-serif; background: #0f172a; color: #e2e8f0; display: flex; min-height: 100vh; }
-        .sidebar { width: 260px; background: #1e293b; padding: 30px 20px; border-left: 1px solid #334155; overflow-y: auto; }
-        .sidebar h2 { color: #f59e0b; margin-bottom: 40px; font-size: 24px; }
-        .sidebar button { display: block; width: 100%; padding: 14px; margin-bottom: 12px; background: #334155; color: #e2e8f0; border: none; border-radius: 8px; cursor: pointer; font-size: 16px; transition: 0.3s; text-align: right; }
+        .sidebar { width: 280px; background: #1e293b; padding: 30px 20px; border-left: 1px solid #334155; overflow-y: auto; }
+        .sidebar h2 { color: #f59e0b; margin-bottom: 30px; font-size: 24px; }
+        .sidebar button { display: block; width: 100%; padding: 14px; margin-bottom: 10px; background: #334155; color: #e2e8f0; border: none; border-radius: 8px; cursor: pointer; font-size: 15px; transition: 0.3s; text-align: right; }
         .sidebar button.active, .sidebar button:hover { background: #f59e0b; color: #0f172a; font-weight: bold; }
         .main { flex: 1; padding: 40px; overflow-y: auto; }
         .section { display: none; }
@@ -587,18 +630,32 @@ DASHBOARD_HTML = """
         table { width: 100%; border-collapse: collapse; margin-top: 20px; }
         th, td { padding: 12px; text-align: right; border-bottom: 1px solid #334155; }
         th { color: #94a3b8; font-weight: bold; }
+        .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }
+        .kpi-card { background: #1e293b; padding: 25px; border-radius: 12px; border: 1px solid #334155; text-align: center; }
+        .kpi-card .value { font-size: 36px; font-weight: bold; color: #f59e0b; }
+        .kpi-card .label { font-size: 14px; color: #94a3b8; margin-top: 8px; }
     </style>
 </head>
 <body>
     <div class="sidebar">
-        <h2>🛡️ حِصْن v4.0</h2>
+        <h2>🛡️ حِصْن v5.0</h2>
+        <button onclick="showSection('executive')">📊 لوحة القيادة</button>
         <button class="active" onclick="showSection('sanctions')">🔍 فحص العقوبات</button>
         <button onclick="showSection('aml')">💰 تقييم AML</button>
         <button onclick="showSection('fraud')">🕵️ كشف الاحتيال</button>
         <button onclick="showSection('sar')">📄 تقارير SAR</button>
         <button onclick="showSection('cases')">📋 إدارة الحالات</button>
+        <button onclick="showSection('audit')">📝 سجل التدقيق</button>
     </div>
     <div class="main">
+        <!-- لوحة القيادة التنفيذية -->
+        <div id="section-executive" class="section">
+            <div class="card">
+                <h3>📊 لوحة القيادة التنفيذية</h3>
+                <button class="refresh" onclick="loadExecutive()">تحديث</button>
+                <div class="kpi-grid" id="kpi-grid"></div>
+            </div>
+        </div>
         <!-- فحص العقوبات -->
         <div id="section-sanctions" class="section active">
             <div class="card">
@@ -609,7 +666,6 @@ DASHBOARD_HTML = """
                 <div id="sanction-result"></div>
             </div>
         </div>
-
         <!-- AML -->
         <div id="section-aml" class="section">
             <div class="card">
@@ -622,7 +678,6 @@ DASHBOARD_HTML = """
                 <div id="aml-result"></div>
             </div>
         </div>
-
         <!-- كشف الاحتيال -->
         <div id="section-fraud" class="section">
             <div class="card">
@@ -636,8 +691,7 @@ DASHBOARD_HTML = """
                 <div id="fraud-result"></div>
             </div>
         </div>
-
-        <!-- تقارير SAR -->
+        <!-- SAR -->
         <div id="section-sar" class="section">
             <div class="card">
                 <h3>📄 إنشاء تقرير اشتباه (SAR)</h3>
@@ -655,7 +709,6 @@ DASHBOARD_HTML = """
                 <div id="sar-list"></div>
             </div>
         </div>
-
         <!-- إدارة الحالات -->
         <div id="section-cases" class="section">
             <div class="card">
@@ -673,6 +726,14 @@ DASHBOARD_HTML = """
                 <div id="case-list"></div>
             </div>
         </div>
+        <!-- سجل التدقيق -->
+        <div id="section-audit" class="section">
+            <div class="card">
+                <h3>📝 سجل التدقيق (Audit Trail)</h3>
+                <button class="refresh" onclick="loadAudit()">تحديث</button>
+                <div id="audit-list"></div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -681,8 +742,53 @@ DASHBOARD_HTML = """
             document.getElementById('section-' + section).classList.add('active');
             document.querySelectorAll('.sidebar button').forEach(btn => btn.classList.remove('active'));
             event.target.classList.add('active');
+            if (section === 'executive') loadExecutive();
             if (section === 'sar') loadSARs();
             if (section === 'cases') loadCases();
+            if (section === 'audit') loadAudit();
+        }
+
+        async function loadExecutive() {
+            const grid = document.getElementById('kpi-grid');
+            grid.innerHTML = '⏳ جاري التحميل...';
+            try {
+                const res = await fetch('/executive/kpis');
+                const data = await res.json();
+                const kpis = [
+                    { label: 'إجمالي تقارير SAR', value: data.total_sar || 0 },
+                    { label: 'حالات مفتوحة', value: data.open_cases || 0 },
+                    { label: 'حالات عالية الأولوية', value: data.high_priority_open || 0 },
+                    { label: 'مدخلات قائمة العقوبات', value: data.watchlist_entries || 0 },
+                    { label: 'معاملات AML (24 ساعة)', value: data.aml_last_24h || 0 },
+                    { label: 'معاملات احتيال (24 ساعة)', value: data.fraud_last_24h || 0 },
+                    { label: 'متوسط الخطورة (7 أيام)', value: data.avg_risk_7d || 0 },
+                    { label: 'تقارير SAR (24 ساعة)', value: data.sar_last_24h || 0 }
+                ];
+                grid.innerHTML = kpis.map(k => `<div class="kpi-card"><div class="value">${k.value}</div><div class="label">${k.label}</div></div>`).join('');
+            } catch (e) {
+                grid.innerHTML = '<p>❌ حدث خطأ في تحميل البيانات.</p>';
+            }
+        }
+
+        async function loadAudit() {
+            const listDiv = document.getElementById('audit-list');
+            listDiv.innerHTML = '⏳ جاري التحميل...';
+            try {
+                const res = await fetch('/audit/list?limit=50');
+                const data = await res.json();
+                if (data.length === 0) {
+                    listDiv.innerHTML = '<p>لا توجد سجلات حتى الآن.</p>';
+                    return;
+                }
+                let html = '<table><tr><th>الإجراء</th><th>المستخدم</th><th>التفاصيل</th><th>التاريخ</th></tr>';
+                data.forEach(a => {
+                    html += `<tr><td>${a.action}</td><td>${a.user_id}</td><td>${a.details || ''}</td><td>${new Date(a.created_at).toLocaleString('ar-SA')}</td></tr>`;
+                });
+                html += '</table>';
+                listDiv.innerHTML = html;
+            } catch (e) {
+                listDiv.innerHTML = '<p>❌ حدث خطأ في تحميل السجلات.</p>';
+            }
         }
 
         async function checkSanctions() {
