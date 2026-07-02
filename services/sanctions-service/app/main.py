@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Optional, List
@@ -7,10 +7,11 @@ from urllib.parse import urlparse
 import os
 import traceback
 from datetime import datetime, timedelta
+import uuid
 import numpy as np
 from sklearn.ensemble import IsolationForest
 
-app = FastAPI(title="Hisn Risk Intelligence Platform", version="3.0.0")
+app = FastAPI(title="Hisn Risk Intelligence Platform", version="4.0.0")
 
 # ============================================================
 # نماذج AML
@@ -67,6 +68,48 @@ class MatchResult(BaseModel):
 class SanctionCheckResponse(BaseModel):
     is_match: bool
     matches: List[MatchResult] = []
+
+# ============================================================
+# نماذج SAR (تقارير الاشتباه)
+# ============================================================
+class SARRequest(BaseModel):
+    subject_name: str
+    subject_id: Optional[str] = None
+    transaction_id: Optional[str] = None
+    reason: str
+    triggered_rules: List[str] = []
+    risk_score: float
+    reported_by: str = "system"
+    notes: Optional[str] = None
+
+class SARResponse(BaseModel):
+    sar_id: str
+    status: str
+    created_at: str
+
+# ============================================================
+# نماذج إدارة الحالات (Case Management)
+# ============================================================
+class CaseCreateRequest(BaseModel):
+    alert_id: Optional[str] = None
+    case_type: str  # "sanctions", "aml", "fraud"
+    subject_name: str
+    subject_id: Optional[str] = None
+    priority: str = "medium"  # "low", "medium", "high", "critical"
+    description: str
+    assigned_to: Optional[str] = None
+    source: str = "system"
+
+class CaseUpdateRequest(BaseModel):
+    status: Optional[str] = None  # "open", "in_progress", "escalated", "closed"
+    notes: Optional[str] = None
+    resolution: Optional[str] = None
+    assigned_to: Optional[str] = None
+
+class CaseResponse(BaseModel):
+    case_id: str
+    status: str
+    created_at: str
 
 # ============================================================
 # دوال قاعدة البيانات
@@ -129,6 +172,44 @@ def init_db():
                 common_location VARCHAR(255),
                 common_device VARCHAR(255),
                 total_transactions INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS hisn.sar_reports (
+                id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+                sar_id VARCHAR(50) UNIQUE NOT NULL,
+                subject_name VARCHAR(500),
+                subject_id VARCHAR(255),
+                transaction_id VARCHAR(255),
+                reason TEXT,
+                triggered_rules TEXT,
+                risk_score DECIMAL(5,2),
+                reported_by VARCHAR(255),
+                notes TEXT,
+                status VARCHAR(50) DEFAULT 'draft',
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS hisn.cases (
+                id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+                case_id VARCHAR(50) UNIQUE NOT NULL,
+                alert_id VARCHAR(255),
+                case_type VARCHAR(50),
+                subject_name VARCHAR(500),
+                subject_id VARCHAR(255),
+                priority VARCHAR(50) DEFAULT 'medium',
+                status VARCHAR(50) DEFAULT 'open',
+                description TEXT,
+                assigned_to VARCHAR(255),
+                resolution TEXT,
+                source VARCHAR(100) DEFAULT 'system',
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS hisn.case_notes (
+                id SERIAL PRIMARY KEY,
+                case_id VARCHAR(50),
+                note TEXT,
+                created_by VARCHAR(255) DEFAULT 'system',
+                created_at TIMESTAMP DEFAULT NOW()
             );
         """)
         conn.commit()
@@ -248,57 +329,41 @@ async def check_fraud(request: FraudRequest):
         triggered = []
 
         ref_time = datetime.fromisoformat(request.timestamp) if request.timestamp else datetime.utcnow()
-
-        # قاعدة 1: سرعة المعاملات
         window_start = ref_time - timedelta(minutes=5)
         cur.execute(
             "SELECT COUNT(*) FROM hisn.fraud_transactions WHERE customer_id = %s AND timestamp >= %s",
             (request.customer_id, window_start)
         )
-        recent_count = cur.fetchone()[0]
-        if recent_count >= 3:
+        if cur.fetchone()[0] >= 3:
             triggered.append("high_velocity_3_in_5min")
             fraud_score += 0.5
 
-        # قاعدة 2: مبلغ غير معتاد
-        cur.execute(
-            "SELECT AVG(amount) FROM hisn.fraud_transactions WHERE customer_id = %s",
-            (request.customer_id,)
-        )
+        cur.execute("SELECT AVG(amount) FROM hisn.fraud_transactions WHERE customer_id = %s", (request.customer_id,))
         avg = cur.fetchone()[0]
         if avg and request.amount > avg * 3:
             triggered.append("unusual_amount_3x_avg")
             fraud_score += 0.4
 
-        # قاعدة 3: موقع مختلف
         if request.location:
-            cur.execute(
-                "SELECT common_location FROM hisn.customer_profiles WHERE customer_id = %s",
-                (request.customer_id,)
-            )
+            cur.execute("SELECT common_location FROM hisn.customer_profiles WHERE customer_id = %s", (request.customer_id,))
             profile = cur.fetchone()
             if profile and profile[0] and profile[0] != request.location:
                 triggered.append("location_mismatch")
                 fraud_score += 0.6
 
-        # قاعدة 4: معاملة ليلية
         hour = ref_time.hour
-        if hour >= 0 and hour < 5:
+        if 0 <= hour < 5:
             triggered.append("off_hours_transaction")
             fraud_score += 0.2
 
-        # قاعدة 5: محاولات فاشلة متعددة
         if request.failed_attempts >= 3:
             triggered.append("multiple_failed_attempts")
             fraud_score += 0.7
 
-        # تخزين المعاملة
         cur.execute(
             "INSERT INTO hisn.fraud_transactions (customer_id, amount, device_id, ip_address, location, transaction_type, failed_attempts, timestamp) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
             (request.customer_id, request.amount, request.device_id, request.ip_address, request.location, request.transaction_type, request.failed_attempts, ref_time)
         )
-
-        # تحديث ملف العميل
         cur.execute(
             """
             INSERT INTO hisn.customer_profiles (customer_id, avg_amount, common_location, common_device, total_transactions)
@@ -309,8 +374,7 @@ async def check_fraud(request: FraudRequest):
                 common_device = COALESCE(%s, hisn.customer_profiles.common_device),
                 total_transactions = hisn.customer_profiles.total_transactions + 1
             """,
-            (request.customer_id, request.amount, request.location, request.device_id,
-             request.amount, request.location, request.device_id)
+            (request.customer_id, request.amount, request.location, request.device_id, request.amount, request.location, request.device_id)
         )
         conn.commit()
         cur.close()
@@ -324,6 +388,154 @@ async def check_fraud(request: FraudRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================================
+# نقطة نهاية SAR (تقارير الاشتباه)
+# ============================================================
+@app.post("/sar/generate", response_model=SARResponse)
+async def generate_sar(request: SARRequest):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        sar_id = f"SAR-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
+        cur.execute(
+            """
+            INSERT INTO hisn.sar_reports (sar_id, subject_name, subject_id, transaction_id, reason, triggered_rules, risk_score, reported_by, notes, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'submitted')
+            """,
+            (sar_id, request.subject_name, request.subject_id, request.transaction_id, request.reason, ",".join(request.triggered_rules), request.risk_score, request.reported_by, request.notes)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        return SARResponse(sar_id=sar_id, status="submitted", created_at=datetime.utcnow().isoformat())
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/sar/list")
+async def list_sars(limit: int = Query(20), status: Optional[str] = None):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        if status:
+            cur.execute("SELECT sar_id, subject_name, risk_score, status, created_at FROM hisn.sar_reports WHERE status = %s ORDER BY created_at DESC LIMIT %s", (status, limit))
+        else:
+            cur.execute("SELECT sar_id, subject_name, risk_score, status, created_at FROM hisn.sar_reports ORDER BY created_at DESC LIMIT %s", (limit,))
+        results = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [{"sar_id": r[0], "subject_name": r[1], "risk_score": float(r[2]), "status": r[3], "created_at": r[4].isoformat()} for r in results]
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================================
+# نقطة نهاية إدارة الحالات (Case Management)
+# ============================================================
+@app.post("/cases/create", response_model=CaseResponse)
+async def create_case(request: CaseCreateRequest):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        case_id = f"CASE-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
+        cur.execute(
+            """
+            INSERT INTO hisn.cases (case_id, alert_id, case_type, subject_name, subject_id, priority, status, description, assigned_to, source)
+            VALUES (%s, %s, %s, %s, %s, %s, 'open', %s, %s, %s)
+            """,
+            (case_id, request.alert_id, request.case_type, request.subject_name, request.subject_id, request.priority, request.description, request.assigned_to, request.source)
+        )
+        if request.description:
+            cur.execute(
+                "INSERT INTO hisn.case_notes (case_id, note, created_by) VALUES (%s, %s, 'system')",
+                (case_id, request.description)
+            )
+        conn.commit()
+        cur.close()
+        conn.close()
+        return CaseResponse(case_id=case_id, status="open", created_at=datetime.utcnow().isoformat())
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/cases/{case_id}/status")
+async def update_case_status(case_id: str, request: CaseUpdateRequest):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        updates = []
+        values = []
+        if request.status:
+            updates.append("status = %s")
+            values.append(request.status)
+        if request.assigned_to:
+            updates.append("assigned_to = %s")
+            values.append(request.assigned_to)
+        if request.resolution:
+            updates.append("resolution = %s")
+            values.append(request.resolution)
+        updates.append("updated_at = NOW()")
+        values.append(case_id)
+        cur.execute(f"UPDATE hisn.cases SET {', '.join(updates)} WHERE case_id = %s", values)
+        if request.notes:
+            cur.execute("INSERT INTO hisn.case_notes (case_id, note) VALUES (%s, %s)", (case_id, request.notes))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"message": "Case updated", "case_id": case_id}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/cases/list")
+async def list_cases(limit: int = Query(20), status: Optional[str] = None, case_type: Optional[str] = None):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        query = "SELECT case_id, case_type, subject_name, priority, status, assigned_to, created_at FROM hisn.cases WHERE 1=1"
+        params = []
+        if status:
+            query += " AND status = %s"
+            params.append(status)
+        if case_type:
+            query += " AND case_type = %s"
+            params.append(case_type)
+        query += " ORDER BY created_at DESC LIMIT %s"
+        params.append(limit)
+        cur.execute(query, params)
+        results = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [{"case_id": r[0], "case_type": r[1], "subject_name": r[2], "priority": r[3], "status": r[4], "assigned_to": r[5], "created_at": r[6].isoformat()} for r in results]
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/cases/{case_id}")
+async def get_case(case_id: str):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT case_id, alert_id, case_type, subject_name, subject_id, priority, status, description, assigned_to, resolution, source, created_at, updated_at FROM hisn.cases WHERE case_id = %s", (case_id,))
+        case = cur.fetchone()
+        if not case:
+            raise HTTPException(status_code=404, detail="Case not found")
+        cur.execute("SELECT note, created_by, created_at FROM hisn.case_notes WHERE case_id = %s ORDER BY created_at", (case_id,))
+        notes = [{"note": n[0], "created_by": n[1], "created_at": n[2].isoformat()} for n in cur.fetchall()]
+        cur.close()
+        conn.close()
+        return {
+            "case_id": case[0], "alert_id": case[1], "case_type": case[2], "subject_name": case[3],
+            "subject_id": case[4], "priority": case[5], "status": case[6], "description": case[7],
+            "assigned_to": case[8], "resolution": case[9], "source": case[10],
+            "created_at": case[11].isoformat(), "updated_at": case[12].isoformat(), "notes": notes
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================================
 # فحص السلامة
 # ============================================================
 @app.get("/health")
@@ -331,7 +543,7 @@ async def health():
     return {"status": "ok", "service": "hisn-platform"}
 
 # ============================================================
-# لوحة التحكم (محدثة - 3 محركات)
+# لوحة التحكم (محدثة - 5 أقسام)
 # ============================================================
 DASHBOARD_HTML = """
 <!DOCTYPE html>
@@ -343,19 +555,21 @@ DASHBOARD_HTML = """
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: 'Tajawal', sans-serif; background: #0f172a; color: #e2e8f0; display: flex; min-height: 100vh; }
-        .sidebar { width: 260px; background: #1e293b; padding: 30px 20px; border-left: 1px solid #334155; }
+        .sidebar { width: 260px; background: #1e293b; padding: 30px 20px; border-left: 1px solid #334155; overflow-y: auto; }
         .sidebar h2 { color: #f59e0b; margin-bottom: 40px; font-size: 24px; }
-        .sidebar button { display: block; width: 100%; padding: 14px; margin-bottom: 12px; background: #334155; color: #e2e8f0; border: none; border-radius: 8px; cursor: pointer; font-size: 16px; transition: 0.3s; }
+        .sidebar button { display: block; width: 100%; padding: 14px; margin-bottom: 12px; background: #334155; color: #e2e8f0; border: none; border-radius: 8px; cursor: pointer; font-size: 16px; transition: 0.3s; text-align: right; }
         .sidebar button.active, .sidebar button:hover { background: #f59e0b; color: #0f172a; font-weight: bold; }
-        .main { flex: 1; padding: 40px; }
+        .main { flex: 1; padding: 40px; overflow-y: auto; }
         .section { display: none; }
         .section.active { display: block; }
         .card { background: #1e293b; padding: 30px; border-radius: 16px; margin-bottom: 20px; border: 1px solid #334155; }
         .card h3 { margin-bottom: 20px; color: #f59e0b; }
         .form-group { margin-bottom: 18px; }
         label { display: block; margin-bottom: 6px; color: #94a3b8; }
-        input, select { width: 100%; padding: 12px; background: #0f172a; border: 1px solid #334155; border-radius: 8px; color: #e2e8f0; font-size: 16px; }
+        input, select, textarea { width: 100%; padding: 12px; background: #0f172a; border: 1px solid #334155; border-radius: 8px; color: #e2e8f0; font-size: 16px; }
+        textarea { min-height: 100px; resize: vertical; }
         button.submit { padding: 12px 30px; background: #f59e0b; color: #0f172a; border: none; border-radius: 8px; cursor: pointer; font-size: 16px; font-weight: bold; }
+        button.refresh { padding: 8px 20px; background: #334155; color: #e2e8f0; border: 1px solid #475569; border-radius: 8px; cursor: pointer; font-size: 14px; }
         .result { margin-top: 20px; padding: 20px; border-radius: 8px; }
         .result.high { background: #7f1d1d; border: 1px solid #ef4444; }
         .result.medium { background: #78350f; border: 1px solid #f59e0b; }
@@ -364,16 +578,28 @@ DASHBOARD_HTML = """
         .result.no-match { background: #14532d; border: 1px solid #22c55e; }
         .badge { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 14px; margin: 4px; }
         .badge.rule { background: #f59e0b; color: #0f172a; }
+        .badge.high { background: #ef4444; color: white; }
+        .badge.medium { background: #f59e0b; color: #0f172a; }
+        .badge.low { background: #22c55e; color: white; }
+        .badge.open { background: #3b82f6; color: white; }
+        .badge.closed { background: #6b7280; color: white; }
+        .badge.submitted { background: #8b5cf6; color: white; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { padding: 12px; text-align: right; border-bottom: 1px solid #334155; }
+        th { color: #94a3b8; font-weight: bold; }
     </style>
 </head>
 <body>
     <div class="sidebar">
-        <h2>🛡️ حِصْن</h2>
+        <h2>🛡️ حِصْن v4.0</h2>
         <button class="active" onclick="showSection('sanctions')">🔍 فحص العقوبات</button>
         <button onclick="showSection('aml')">💰 تقييم AML</button>
         <button onclick="showSection('fraud')">🕵️ كشف الاحتيال</button>
+        <button onclick="showSection('sar')">📄 تقارير SAR</button>
+        <button onclick="showSection('cases')">📋 إدارة الحالات</button>
     </div>
     <div class="main">
+        <!-- فحص العقوبات -->
         <div id="section-sanctions" class="section active">
             <div class="card">
                 <h3>🔍 فحص قوائم العقوبات</h3>
@@ -383,6 +609,8 @@ DASHBOARD_HTML = """
                 <div id="sanction-result"></div>
             </div>
         </div>
+
+        <!-- AML -->
         <div id="section-aml" class="section">
             <div class="card">
                 <h3>💰 تقييم مخاطر غسل الأموال</h3>
@@ -394,6 +622,8 @@ DASHBOARD_HTML = """
                 <div id="aml-result"></div>
             </div>
         </div>
+
+        <!-- كشف الاحتيال -->
         <div id="section-fraud" class="section">
             <div class="card">
                 <h3>🕵️ كشف الاحتيال</h3>
@@ -406,14 +636,55 @@ DASHBOARD_HTML = """
                 <div id="fraud-result"></div>
             </div>
         </div>
+
+        <!-- تقارير SAR -->
+        <div id="section-sar" class="section">
+            <div class="card">
+                <h3>📄 إنشاء تقرير اشتباه (SAR)</h3>
+                <div class="form-group"><label>اسم الشخص / الكيان</label><input type="text" id="sar-subject" placeholder="الاسم الكامل"></div>
+                <div class="form-group"><label>رقم هوية العميل</label><input type="text" id="sar-subject-id" placeholder="رقم الهوية (اختياري)"></div>
+                <div class="form-group"><label>سبب الاشتباه</label><textarea id="sar-reason" placeholder="وصف سبب الاشتباه..."></textarea></div>
+                <div class="form-group"><label>القواعد المشغلة</label><input type="text" id="sar-rules" placeholder="مثال: high_amount_exceeds_50k, high_risk_country"></div>
+                <div class="form-group"><label>درجة الخطورة</label><input type="number" id="sar-score" placeholder="0.0 - 1.0" step="0.1" min="0" max="1"></div>
+                <button class="submit" onclick="generateSAR()">إنشاء التقرير</button>
+                <div id="sar-result"></div>
+            </div>
+            <div class="card">
+                <h3>📋 قائمة التقارير</h3>
+                <button class="refresh" onclick="loadSARs()">تحديث</button>
+                <div id="sar-list"></div>
+            </div>
+        </div>
+
+        <!-- إدارة الحالات -->
+        <div id="section-cases" class="section">
+            <div class="card">
+                <h3>📝 إنشاء حالة جديدة</h3>
+                <div class="form-group"><label>نوع الحالة</label><select id="case-type"><option value="sanctions">عقوبات</option><option value="aml">AML</option><option value="fraud">احتيال</option></select></div>
+                <div class="form-group"><label>اسم الشخص / الكيان</label><input type="text" id="case-subject" placeholder="الاسم الكامل"></div>
+                <div class="form-group"><label>الأولوية</label><select id="case-priority"><option value="low">منخفضة</option><option value="medium" selected>متوسطة</option><option value="high">عالية</option><option value="critical">حرجة</option></select></div>
+                <div class="form-group"><label>الوصف</label><textarea id="case-description" placeholder="وصف الحالة..."></textarea></div>
+                <button class="submit" onclick="createCase()">إنشاء الحالة</button>
+                <div id="case-create-result"></div>
+            </div>
+            <div class="card">
+                <h3>📋 قائمة الحالات</h3>
+                <button class="refresh" onclick="loadCases()">تحديث</button>
+                <div id="case-list"></div>
+            </div>
+        </div>
     </div>
+
     <script>
         function showSection(section) {
             document.querySelectorAll('.section').forEach(el => el.classList.remove('active'));
             document.getElementById('section-' + section).classList.add('active');
             document.querySelectorAll('.sidebar button').forEach(btn => btn.classList.remove('active'));
             event.target.classList.add('active');
+            if (section === 'sar') loadSARs();
+            if (section === 'cases') loadCases();
         }
+
         async function checkSanctions() {
             const name = document.getElementById('sanction-name').value;
             const lang = document.getElementById('sanction-lang').value;
@@ -435,6 +706,7 @@ DASHBOARD_HTML = """
                 resultDiv.innerHTML = '<div class="result high">❌ حدث خطأ في الاتصال بالخدمة.</div>';
             }
         }
+
         async function evaluateAML() {
             const customer = document.getElementById('aml-customer').value;
             const amount = parseFloat(document.getElementById('aml-amount').value);
@@ -460,6 +732,7 @@ DASHBOARD_HTML = """
                 resultDiv.innerHTML = '<div class="result high">❌ حدث خطأ في الاتصال بالخدمة.</div>';
             }
         }
+
         async function checkFraud() {
             const customer = document.getElementById('fraud-customer').value;
             const amount = parseFloat(document.getElementById('fraud-amount').value);
@@ -484,6 +757,92 @@ DASHBOARD_HTML = """
                 resultDiv.innerHTML = html;
             } catch (e) {
                 resultDiv.innerHTML = '<div class="result high">❌ حدث خطأ في الاتصال بالخدمة.</div>';
+            }
+        }
+
+        async function generateSAR() {
+            const subject = document.getElementById('sar-subject').value;
+            const subjectId = document.getElementById('sar-subject-id').value;
+            const reason = document.getElementById('sar-reason').value;
+            const rules = document.getElementById('sar-rules').value.split(',').map(r => r.trim()).filter(r => r);
+            const score = parseFloat(document.getElementById('sar-score').value) || 0;
+            const resultDiv = document.getElementById('sar-result');
+            resultDiv.innerHTML = '⏳ جاري إنشاء التقرير...';
+            try {
+                const res = await fetch('/sar/generate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ subject_name: subject, subject_id: subjectId, reason: reason, triggered_rules: rules, risk_score: score })
+                });
+                const data = await res.json();
+                resultDiv.innerHTML = `<div class="result low"><strong>✅ تم إنشاء التقرير بنجاح!</strong><br>رقم التقرير: <strong>${data.sar_id}</strong><br>الحالة: ${data.status}</div>`;
+                loadSARs();
+            } catch (e) {
+                resultDiv.innerHTML = '<div class="result high">❌ حدث خطأ في الاتصال بالخدمة.</div>';
+            }
+        }
+
+        async function loadSARs() {
+            const listDiv = document.getElementById('sar-list');
+            listDiv.innerHTML = '⏳ جاري التحميل...';
+            try {
+                const res = await fetch('/sar/list?limit=20');
+                const data = await res.json();
+                if (data.length === 0) {
+                    listDiv.innerHTML = '<p>لا توجد تقارير حتى الآن.</p>';
+                    return;
+                }
+                let html = '<table><tr><th>رقم التقرير</th><th>الاسم</th><th>الخطورة</th><th>الحالة</th><th>التاريخ</th></tr>';
+                data.forEach(sar => {
+                    html += `<tr><td>${sar.sar_id}</td><td>${sar.subject_name}</td><td>${sar.risk_score}</td><td><span class="badge submitted">${sar.status}</span></td><td>${new Date(sar.created_at).toLocaleString('ar-SA')}</td></tr>`;
+                });
+                html += '</table>';
+                listDiv.innerHTML = html;
+            } catch (e) {
+                listDiv.innerHTML = '<p>❌ حدث خطأ في تحميل التقارير.</p>';
+            }
+        }
+
+        async function createCase() {
+            const type = document.getElementById('case-type').value;
+            const subject = document.getElementById('case-subject').value;
+            const priority = document.getElementById('case-priority').value;
+            const description = document.getElementById('case-description').value;
+            const resultDiv = document.getElementById('case-create-result');
+            resultDiv.innerHTML = '⏳ جاري إنشاء الحالة...';
+            try {
+                const res = await fetch('/cases/create', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ case_type: type, subject_name: subject, priority: priority, description: description })
+                });
+                const data = await res.json();
+                resultDiv.innerHTML = `<div class="result low"><strong>✅ تم إنشاء الحالة بنجاح!</strong><br>رقم الحالة: <strong>${data.case_id}</strong></div>`;
+                loadCases();
+            } catch (e) {
+                resultDiv.innerHTML = '<div class="result high">❌ حدث خطأ في الاتصال بالخدمة.</div>';
+            }
+        }
+
+        async function loadCases() {
+            const listDiv = document.getElementById('case-list');
+            listDiv.innerHTML = '⏳ جاري التحميل...';
+            try {
+                const res = await fetch('/cases/list?limit=20');
+                const data = await res.json();
+                if (data.length === 0) {
+                    listDiv.innerHTML = '<p>لا توجد حالات حتى الآن.</p>';
+                    return;
+                }
+                let html = '<table><tr><th>رقم الحالة</th><th>النوع</th><th>الاسم</th><th>الأولوية</th><th>الحالة</th><th>التاريخ</th></tr>';
+                data.forEach(c => {
+                    const statusClass = c.status === 'open' ? 'open' : c.status === 'closed' ? 'closed' : 'submitted';
+                    html += `<tr><td>${c.case_id}</td><td>${c.case_type}</td><td>${c.subject_name}</td><td><span class="badge ${c.priority}">${c.priority}</span></td><td><span class="badge ${statusClass}">${c.status}</span></td><td>${new Date(c.created_at).toLocaleString('ar-SA')}</td></tr>`;
+                });
+                html += '</table>';
+                listDiv.innerHTML = html;
+            } catch (e) {
+                listDiv.innerHTML = '<p>❌ حدث خطأ في تحميل الحالات.</p>';
             }
         }
     </script>
